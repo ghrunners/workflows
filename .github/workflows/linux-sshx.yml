@@ -19,13 +19,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prereqs (root shell + wipe /root)
+      - name: Prereqs (root shell + land in HOME)
         run: |
-          # Every new sshx terminal must land in a root shell.
+          # Every new sshx terminal must land in a root shell at HOME (/root).
           # GitHub steps are non-interactive (no bashrc sourced), so appending
           # to ~/.bashrc only affects interactive shells (sshx/upterm tmux).
           if ! grep -q "IN_ROOT_SHELL" ~/.bashrc 2>/dev/null; then
             printf '\nif [ "$(id -u)" -ne 0 ] && [ -z "$IN_ROOT_SHELL" ]; then export IN_ROOT_SHELL=1; exec sudo -i; fi\n' >> ~/.bashrc
+          fi
+          # Interactive shells (runner + root) always cd to HOME so terminals
+          # open at ~ instead of $GITHUB_WORKSPACE (/home/runner/work/*/*).
+          if ! grep -q "cd /root" ~/.bashrc 2>/dev/null; then
+            printf 'cd /root 2>/dev/null || cd ~ 2>/dev/null || true\n' >> ~/.bashrc
+          fi
+          sudo mkdir -p /root
+          if ! sudo grep -q "cd /root" /root/.bashrc 2>/dev/null; then
+            echo 'cd /root 2>/dev/null || cd ~ 2>/dev/null || true' | sudo tee -a /root/.bashrc >/dev/null
           fi
           # Fresh machine: wipe anything left in /root
           sudo rm -rf /root/* 2>/dev/null || true
@@ -49,10 +58,19 @@ jobs:
           BIN="$BIN_DIR/sshx"
           chmod +x "$BIN"
 
+          # Launch from HOME so new terminals open at ~, not $GITHUB_WORKSPACE.
+          cd /root || cd ~
+          export HOME=/root
+
           RAW=/tmp/sshx_raw.log; touch "$RAW"
           # Run as root so every sshx terminal is root
           stdbuf -o0 -e0 sudo -E "$BIN" > "$RAW" 2>&1 &
           SSHX_PID=$!
+
+          clean_ansi() {
+            # Strip ANSI CSI/OSC sequences and carriage returns
+            printf '%s' "$1" | sed -r -e 's/\x1b\][^\x07]*(\x07|\x1b\\)//g' -e 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' | tr -d '\r' | awk '{print $1}'
+          }
 
           post_link() {
             echo "::add-mask::$1"
@@ -66,9 +84,9 @@ jobs:
           # Tail the raw log, print everything EXCEPT the link (redacted)
           tail -n +1 -F "$RAW" 2>/dev/null | while IFS= read -r line; do
             if [[ "$line" =~ https://sshx\.io/s/[^[:space:]]+ ]]; then
-              LINK="${BASH_REMATCH[0]}"
+              LINK="$(clean_ansi "${BASH_REMATCH[0]}")"
               if [ ! -f /tmp/sshx.sent ]; then post_link "$LINK"; fi
-              echo "${line//$LINK/[REDACTED -> web tool]}"
+              echo "${line//$BASH_REMATCH/[REDACTED -> web tool]}"
             else
               echo "$line"
             fi
