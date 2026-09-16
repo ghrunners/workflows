@@ -1,0 +1,88 @@
+name: Windows RDP via zrok (managed)
+
+# Per-runner secrets (set by the web tool, never hardcoded):
+#   ZROK_TOKEN   - zrok environment token (enables + shares)
+#   RDP_PASSWORD - password for .\runneradmin (generated per runner)
+# Inputs carry the one-time callback; the share token
+#   `zrok access private <TOKEN>`
+# is extracted, masked, POSTed to the web tool, and redacted from logs.
+# All other zrok JSON logs stay visible.
+
+on:
+  workflow_dispatch:
+    inputs:
+      callback_url:
+        description: "Worker callback URL (https://<worker>/api/callback)"
+        required: true
+        type: string
+      callback_token:
+        description: "One-time bearer token for this runner"
+        required: true
+        type: string
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Download zrok
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/meownyaaa/rdp-windows-workflow/releases/download/august2025/zrok.exe" -OutFile "C:\Windows\zrok2.exe"
+
+      - name: Enable zrok
+        env:
+          ZROK_TOKEN: ${{ secrets.ZROK_TOKEN }}
+        run: |
+          Write-Host "::add-mask::$env:ZROK_TOKEN"
+          C:\Windows\zrok2.exe enable $env:ZROK_TOKEN --headless
+
+      - name: Enable RDP
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service TermService
+
+      - name: Set RDP password (from secret, never logged)
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "::add-mask::$env:RDP_PASSWORD"
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force)
+          Write-Host "Password set for runneradmin (value in web tool only)."
+
+      - name: Start zrok share (token redacted, sent to web tool)
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+        run: |
+          Write-Host "::add-mask::$env:CALLBACK_TOKEN"
+          $raw = "$env:TEMP\zrok_raw.log"
+          $err = "$env:TEMP\zrok_err.log"
+          if (Test-Path $raw) { Remove-Item $raw -Force }
+          $proc = Start-Process -FilePath "C:\Windows\zrok2.exe" -ArgumentList "share","private","--headless","--backend-mode","tcpTunnel","localhost:3389" -RedirectStandardOutput $raw -RedirectStandardError $err -NoNewWindow -PassThru
+          $sent = $false
+          $shown = 0
+          while (-not $proc.HasExited) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $raw) {
+              $lines = Get-Content $raw
+              for ($i = $shown; $i -lt $lines.Count; $i++) {
+                $line = $lines[$i]
+                if ($line -match 'zrok access private (\S+)') {
+                  $tok = $Matches[1].Trim().Trim('"')
+                  if (-not $sent) {
+                    Write-Host "::add-mask::$tok"
+                    $body = @{ type = "rdp"; share_token = $tok } | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Method Post -Uri $env:CALLBACK_URL -Headers @{ Authorization = "Bearer $($env:CALLBACK_TOKEN)" } -ContentType "application/json" -Body $body
+                    $sent = $true
+                  }
+                  $line = $line -replace 'zrok access private \S+', 'zrok access private [REDACTED -> web tool]'
+                }
+                Write-Host $line
+              }
+              $shown = $lines.Count
+            }
+          }
+          if ($proc.ExitCode -ne 0) { Write-Host "zrok exited with code $($proc.ExitCode)"; Get-Content $err | Write-Host; exit 1 }

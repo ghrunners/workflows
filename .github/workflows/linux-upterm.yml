@@ -1,0 +1,70 @@
+name: upterm session (managed, action version)
+
+# NOTE on redaction: owenthereal/action-upterm prints
+#   "SSH: ssh <user>@uptermd.upterm.dev"
+# from inside the action itself, before any of our steps can mask it.
+# Isolation is therefore provided by the per-runner PRIVATE repo (only the
+# PAT holder can read its logs). The step below additionally:
+#   1. reads the action's `ssh-command` output,
+#   2. registers it with ::add-mask:: (masks all subsequent prints),
+#   3. POSTs the real value to the web tool, never echoing it.
+# Ephemeral key: the web tool generates one ed25519 keypair per runner,
+# adds the PUBLIC key to the temp account (POST /user/keys) BEFORE dispatch,
+# and shows the PRIVATE key only in the web UI. limit-access-to-actor then
+# authorizes exactly that key (+ any pre-existing account keys).
+
+on:
+  workflow_dispatch:
+    inputs:
+      callback_url:
+        description: "Worker callback URL (https://<worker>/api/callback)"
+        required: true
+        type: string
+      callback_token:
+        description: "One-time bearer token for this runner"
+        required: true
+        type: string
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prereqs (root shell + wipe /root)
+        run: |
+          # Same prereq as sshx: interactive shells auto-escalate to root.
+          # Workflow steps themselves are unaffected (non-interactive bash).
+          if ! grep -q "IN_ROOT_SHELL" ~/.bashrc 2>/dev/null; then
+            printf '\nif [ "$(id -u)" -ne 0 ] && [ -z "$IN_ROOT_SHELL" ]; then export IN_ROOT_SHELL=1; exec sudo -i; fi\n' >> ~/.bashrc
+          fi
+          sudo rm -rf /root/* 2>/dev/null || true
+          sudo mkdir -p /root
+          echo "prereqs ok"
+
+      - name: Setup upterm session
+        id: upterm
+        uses: owenthereal/action-upterm@v1
+        with:
+          limit-access-to-actor: true
+          detached: true
+          wait-timeout-minutes: 350
+
+      - name: Exfiltrate + mask ssh command (never printed)
+        if: always()
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+          SSH_CMD: ${{ steps.upterm.outputs.ssh-command }}
+        run: |
+          set +x
+          echo "::add-mask::$CALLBACK_TOKEN"
+          if [ -z "$SSH_CMD" ]; then echo "no ssh-command output (upterm may have failed)"; exit 1; fi
+          echo "::add-mask::$SSH_CMD"
+          PAYLOAD="$(jq -n --arg s "$SSH_CMD" '{type:"upterm",ssh_command:$s}')"
+          curl -sSf -X POST "$CALLBACK_URL" \
+            -H "Authorization: Bearer $CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" || { echo "callback failed"; exit 1; }
+          echo "SSH command delivered to web tool (redacted from logs)."

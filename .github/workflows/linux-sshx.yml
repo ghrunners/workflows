@@ -1,0 +1,79 @@
+name: sshx session (managed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      callback_url:
+        description: "Worker callback URL (https://<worker>/api/callback)"
+        required: true
+        type: string
+      callback_token:
+        description: "One-time bearer token for this runner"
+        required: true
+        type: string
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prereqs (root shell + wipe /root)
+        run: |
+          # Every new sshx terminal must land in a root shell.
+          # GitHub steps are non-interactive (no bashrc sourced), so appending
+          # to ~/.bashrc only affects interactive shells (sshx/upterm tmux).
+          if ! grep -q "IN_ROOT_SHELL" ~/.bashrc 2>/dev/null; then
+            printf '\nif [ "$(id -u)" -ne 0 ] && [ -z "$IN_ROOT_SHELL" ]; then export IN_ROOT_SHELL=1; exec sudo -i; fi\n' >> ~/.bashrc
+          fi
+          # Fresh machine: wipe anything left in /root
+          sudo rm -rf /root/* 2>/dev/null || true
+          sudo mkdir -p /root
+          echo "prereqs ok"
+
+      - name: Setup sshx session (link redacted, sent to web tool)
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_TOKEN: ${{ inputs.callback_token }}
+        run: |
+          set +x
+          echo "::add-mask::$CALLBACK_TOKEN"
+          BIN_DIR="$(mktemp -d)"
+          # Download sshx binary (same source as sshx.io/get, but controlled exec)
+          ARCH="x86_64"; SUFFIX="-unknown-linux-musl"
+          case "$(uname -m)" in aarch64|arm64) ARCH="aarch64";; esac
+          URL="https://s3.amazonaws.com/sshx/sshx-${ARCH}${SUFFIX}.tar.gz"
+          curl -sSfL "$URL" -o /tmp/sshx.tgz
+          tar xzf /tmp/sshx.tgz -C "$BIN_DIR"
+          BIN="$BIN_DIR/sshx"
+          chmod +x "$BIN"
+
+          RAW=/tmp/sshx_raw.log; touch "$RAW"
+          # Run as root so every sshx terminal is root
+          stdbuf -o0 -e0 sudo -E "$BIN" > "$RAW" 2>&1 &
+          SSHX_PID=$!
+
+          post_link() {
+            echo "::add-mask::$1"
+            PAYLOAD="$(jq -n --arg u "$1" '{type:"sshx",url:$u}')"
+            curl -sSf -X POST "$CALLBACK_URL" \
+              -H "Authorization: Bearer $CALLBACK_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" && touch /tmp/sshx.sent || echo "callback failed"
+          }
+
+          # Tail the raw log, print everything EXCEPT the link (redacted)
+          tail -n +1 -F "$RAW" 2>/dev/null | while IFS= read -r line; do
+            if [[ "$line" =~ https://sshx\.io/s/[^[:space:]]+ ]]; then
+              LINK="${BASH_REMATCH[0]}"
+              if [ ! -f /tmp/sshx.sent ]; then post_link "$LINK"; fi
+              echo "${line//$LINK/[REDACTED -> web tool]}"
+            else
+              echo "$line"
+            fi
+          done &
+          TAIL_PID=$!
+
+          wait $SSHX_PID
+          kill $TAIL_PID 2>/dev/null || true
