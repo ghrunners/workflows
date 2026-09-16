@@ -1,17 +1,15 @@
-name: upterm session (managed, action version)
+name: upterm session (managed, redacted)
 
-# NOTE on redaction: owenthereal/action-upterm prints
-#   "SSH: ssh <user>@uptermd.upterm.dev"
-# from inside the action itself, before any of our steps can mask it.
-# Isolation is therefore provided by the per-runner PRIVATE repo (only the
-# PAT holder can read its logs). The step below additionally:
-#   1. reads the action's `ssh-command` output,
-#   2. registers it with ::add-mask:: (masks all subsequent prints),
-#   3. POSTs the real value to the web tool, never echoing it.
+# Manual upterm (no owenthereal/action-upterm): that action prints the SSH
+# command via core.info/notice/console.log AND writes it to the job summary,
+# which cannot be masked in time. With PUBLIC per-runner repos anyone could
+# read it. Here every byte of upterm output goes to a file; only the
+# redacted placeholder reaches the logs. The real ssh command is masked
+# (::add-mask::) and POSTed to the web tool, never echoed.
 # Ephemeral key: the web tool generates one ed25519 keypair per runner,
 # adds the PUBLIC key to the temp account (POST /user/keys) BEFORE dispatch,
-# and shows the PRIVATE key only in the web UI. limit-access-to-actor then
-# authorizes exactly that key (+ any pre-existing account keys).
+# and shows the PRIVATE key only in the web UI. --github-user authorizes
+# exactly that account's keys.
 
 on:
   workflow_dispatch:
@@ -32,39 +30,96 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prereqs (root shell + wipe /root)
+      - name: Prereqs (root shell + land in HOME)
         run: |
-          # Same prereq as sshx: interactive shells auto-escalate to root.
-          # Workflow steps themselves are unaffected (non-interactive bash).
+          # Interactive shells auto-escalate to root and land at HOME (/root),
+          # not $GITHUB_WORKSPACE. Workflow steps are non-interactive bash.
           if ! grep -q "IN_ROOT_SHELL" ~/.bashrc 2>/dev/null; then
             printf '\nif [ "$(id -u)" -ne 0 ] && [ -z "$IN_ROOT_SHELL" ]; then export IN_ROOT_SHELL=1; exec sudo -i; fi\n' >> ~/.bashrc
           fi
+          if ! grep -q "cd /root" ~/.bashrc 2>/dev/null; then
+            printf 'cd /root 2>/dev/null || cd ~ 2>/dev/null || true\n' >> ~/.bashrc
+          fi
+          sudo mkdir -p /root
+          if ! sudo grep -q "cd /root" /root/.bashrc 2>/dev/null; then
+            echo 'cd /root 2>/dev/null || cd ~ 2>/dev/null || true' | sudo tee -a /root/.bashrc >/dev/null
+          fi
           sudo rm -rf /root/* 2>/dev/null || true
           sudo mkdir -p /root
+          if ! command -v tmux >/dev/null 2>&1; then sudo apt-get update && sudo apt-get -y install tmux; fi
           echo "prereqs ok"
 
-      - name: Setup upterm session
-        id: upterm
-        uses: owenthereal/action-upterm@v1
-        with:
-          limit-access-to-actor: true
-          detached: true
-          wait-timeout-minutes: 350
-
-      - name: Exfiltrate + mask ssh command (never printed)
-        if: always()
+      - name: Setup upterm session (ssh command redacted, sent to web tool)
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
           CALLBACK_TOKEN: ${{ inputs.callback_token }}
-          SSH_CMD: ${{ steps.upterm.outputs.ssh-command }}
+          UPTERM_ACTOR: ${{ github.triggering_actor }}
         run: |
           set +x
           echo "::add-mask::$CALLBACK_TOKEN"
-          if [ -z "$SSH_CMD" ]; then echo "no ssh-command output (upterm may have failed)"; exit 1; fi
+          # Launch from HOME so terminals open at ~, not $GITHUB_WORKSPACE.
+          cd /root || cd ~
+          export HOME=/root
+
+          clean_ansi() {
+            printf '%s' "$1" | sed -r -e 's/\x1b\][^\x07]*(\x07|\x1b\\)//g' -e 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' | tr -d '\r'
+          }
+
+          # --- install upterm binary ---
+          ARCH=amd64; case "$(uname -m)" in aarch64|arm64) ARCH=arm64;; esac
+          UTMP="$(mktemp -d)"
+          curl -sSfL "https://github.com/owenthereal/upterm/releases/latest/download/upterm_linux_${ARCH}.tar.gz" -o "$UTMP/upterm.tgz"
+          tar xzf "$UTMP/upterm.tgz" -C "$UTMP"
+          UPTERM="$UTMP/upterm"
+          chmod +x "$UPTERM"
+
+          # --- minimal ssh client setup (mirrors action-upterm) ---
+          mkdir -p ~/.ssh
+          [ -f ~/.ssh/id_rsa ] || ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa
+          [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/id_ed25519
+          if ! grep -q "StrictHostKeyChecking no" ~/.ssh/config 2>/dev/null; then
+            printf 'Host *\n  StrictHostKeyChecking no\n  CheckHostIP no\n  TCPKeepAlive yes\n  ServerAliveInterval 30\n  ServerAliveCountMax 180\n  AddressFamily inet\n' >> ~/.ssh/config
+          fi
+
+          # --- deterministic XDG dirs (mirrors action-upterm) ---
+          export XDG_RUNTIME_DIR=/tmp/upterm-data/runtime XDG_STATE_HOME=/tmp/upterm-data/state XDG_CONFIG_HOME=/tmp/upterm-data/config
+          mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME"
+          SOCKDIR="$XDG_RUNTIME_DIR/upterm"
+          CMDLOG="$XDG_STATE_HOME/upterm-command.log"
+          printf '# upterm tmux conf\nset-environment -g XDG_RUNTIME_DIR "%s"\nset-environment -g XDG_STATE_HOME "%s"\nset-environment -g XDG_CONFIG_HOME "%s"\nset-option -ga update-environment " UPTERM_ADMIN_SOCKET"\nsetw -g aggressive-resize on\n' \
+            "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" > /tmp/upterm-data/tmux.conf
+
+          # --- start session detached; ALL output goes to file, never to logs ---
+          tmux -f /tmp/upterm-data/tmux.conf new -d -s upterm-wrapper -x 132 -y 43 \
+            "$UPTERM host --skip-host-key-check --accept --server 'ssh://uptermd.upterm.dev:22' --github-user '$UPTERM_ACTOR' --force-command 'tmux attach -t upterm' -- tmux -f /tmp/upterm-data/tmux.conf new -s upterm -x 132 -y 43 2>&1 | tee $CMDLOG"
+
+          # --- wait for admin socket ---
+          SOCK=""
+          for i in $(seq 1 60); do
+            SOCK="$(ls "$SOCKDIR"/*.sock 2>/dev/null | head -n1)"
+            [ -n "$SOCK" ] && break
+            sleep 2
+          done
+          if [ -z "$SOCK" ]; then echo "upterm failed to start (no admin socket)"; tail -n 50 "$CMDLOG" 2>/dev/null | sed 's/ssh [^ ]*@[^ ]*/ssh [REDACTED]/g'; exit 1; fi
+
+          # --- extract ssh command from socket (never printed) ---
+          INFO="$("$UPTERM" session current --admin-socket "$SOCK" 2>/dev/null)"
+          SSH_CMD="$(printf '%s' "$INFO" | grep -oE 'ssh [^[:space:]]+@[^[:space:]]+' | head -n1)"
+          SSH_CMD="$(clean_ansi "$SSH_CMD" | awk '{print $1, $2}')"
+          if [ -z "$SSH_CMD" ]; then echo "could not parse ssh command"; exit 1; fi
           echo "::add-mask::$SSH_CMD"
           PAYLOAD="$(jq -n --arg s "$SSH_CMD" '{type:"upterm",ssh_command:$s}')"
           curl -sSf -X POST "$CALLBACK_URL" \
             -H "Authorization: Bearer $CALLBACK_TOKEN" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" || { echo "callback failed"; exit 1; }
-          echo "SSH command delivered to web tool (redacted from logs)."
+          echo "SSH command delivered to web tool (redacted from logs). Session live."
+
+          # --- keepalive: hold the job without ever printing session info ---
+          DEADLINE=$(( $(date +%s) + 350*60 ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            sleep 15
+            [ -f /continue ] || [ -f "$GITHUB_WORKSPACE/continue" ] && { echo "continue file found, exiting"; break; }
+            ls "$SOCKDIR"/*.sock >/dev/null 2>&1 || { echo "session ended"; break; }
+            tmux has-session -t upterm-wrapper 2>/dev/null || { echo "session ended"; break; }
+          done
