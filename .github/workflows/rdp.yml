@@ -101,5 +101,5 @@ jobs:
         if: always()
         run: |
           try { Stop-Process -Name "zrok2" -Force -ErrorAction SilentlyContinue } catch {}
-          C:\Windows\zrok2.exe disable --headless
+          C:\Windows\zrok2.exe disable
           exit 0
