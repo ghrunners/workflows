@@ -63,26 +63,36 @@ jobs:
           if (Test-Path $raw) { Remove-Item $raw -Force }
           $proc = Start-Process -FilePath "C:\Windows\zrok2.exe" -ArgumentList "share","private","--headless","--backend-mode","tcpTunnel","localhost:3389" -RedirectStandardOutput $raw -RedirectStandardError $err -NoNewWindow -PassThru
           $sent = $false
-          $shown = 0
+          $shown = @{}
           while (-not $proc.HasExited) {
             Start-Sleep -Seconds 2
-            if (Test-Path $raw) {
-              $lines = Get-Content $raw
-              for ($i = $shown; $i -lt $lines.Count; $i++) {
+            # NOTE: headless share prints the access line via logrus to STDERR,
+            # so both output streams must be scanned (stdout + stderr).
+            foreach ($f in @($raw, $err)) {
+              if (-not (Test-Path $f)) { continue }
+              $lines = Get-Content $f
+              $seen = if ($shown.ContainsKey($f)) { $shown[$f] } else { 0 }
+              for ($i = $seen; $i -lt $lines.Count; $i++) {
                 $line = $lines[$i]
                 if ($line -match 'zrok access private (\S+)') {
-                  $tok = $Matches[1].Trim().Trim('"')
+                  # Token may be JSON-escaped (...private TOKEN","time":...), cut at first quote.
+                  $tok = (($Matches[1] -split '"')[0]).Trim().Trim('\')
                   if (-not $sent) {
                     Write-Host "::add-mask::$tok"
                     $body = @{ type = "rdp"; share_token = $tok } | ConvertTo-Json -Compress
-                    Invoke-RestMethod -Method Post -Uri $env:CALLBACK_URL -Headers @{ Authorization = "Bearer $($env:CALLBACK_TOKEN)" } -ContentType "application/json" -Body $body
-                    $sent = $true
+                    try {
+                      Invoke-RestMethod -Method Post -Uri $env:CALLBACK_URL -Headers @{ Authorization = "Bearer $($env:CALLBACK_TOKEN)" } -ContentType "application/json" -Body $body
+                      $sent = $true
+                      Write-Host "Share token delivered to web tool (redacted from logs)."
+                    } catch {
+                      Write-Host "Callback failed, will retry on next poll: $($_.Exception.Message)"
+                    }
                   }
                   $line = $line -replace 'zrok access private \S+', 'zrok access private [REDACTED -> web tool]'
                 }
                 Write-Host $line
               }
-              $shown = $lines.Count
+              $shown[$f] = $lines.Count
             }
           }
           if ($proc.ExitCode -ne 0) { Write-Host "zrok exited with code $($proc.ExitCode)"; Get-Content $err | Write-Host; exit 1 }
