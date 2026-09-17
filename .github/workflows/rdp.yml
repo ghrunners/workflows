@@ -86,3 +86,10 @@ jobs:
             }
           }
           if ($proc.ExitCode -ne 0) { Write-Host "zrok exited with code $($proc.ExitCode)"; Get-Content $err | Write-Host; exit 1 }
+
+      - name: Cleanup zrok environment (always)
+        if: always()
+        run: |
+          try { Stop-Process -Name "zrok2" -Force -ErrorAction SilentlyContinue } catch {}
+          C:\Windows\zrok2.exe disable --headless
+          exit 0
