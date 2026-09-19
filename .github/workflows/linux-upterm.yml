@@ -100,7 +100,7 @@ jobs:
           # --- wait for admin socket ---
           SOCK=""
           for i in $(seq 1 60); do
-            SOCK="$(ls "$SOCKDIR"/*.sock 2>/dev/null | head -n1)"
+            SOCK="$(sudo ls "$SOCKDIR"/*.sock 2>/dev/null | head -n1)"
             [ -n "$SOCK" ] && break
             sleep 2
           done
@@ -132,6 +132,6 @@ jobs:
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             sleep 15
             [ -f /continue ] || [ -f "$GITHUB_WORKSPACE/continue" ] && { echo "continue file found, exiting"; break; }
-            ls "$SOCKDIR"/*.sock >/dev/null 2>&1 || { echo "session ended"; break; }
+            sudo ls "$SOCKDIR"/*.sock >/dev/null 2>&1 || { echo "session ended"; break; }
             sudo tmux -f /tmp/upterm-data/tmux.conf has-session -t upterm-wrapper 2>/dev/null || { echo "session ended"; break; }
           done
