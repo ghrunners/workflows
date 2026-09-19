@@ -58,8 +58,8 @@ jobs:
           BIN="$BIN_DIR/sshx"
           chmod +x "$BIN"
 
-          # Launch from HOME so new terminals open at ~, not $GITHUB_WORKSPACE.
-          cd /root || cd ~
+          # Setup runs as runner; only the sshx daemon runs via sudo with HOME=/root.
+          cd /root 2>/dev/null || cd ~ || true
           export HOME=/root
 
           RAW=/tmp/sshx_raw.log; touch "$RAW"
