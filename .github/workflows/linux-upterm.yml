@@ -57,9 +57,11 @@ jobs:
         run: |
           set +x
           echo "::add-mask::$CALLBACK_TOKEN"
-          # Launch from HOME so terminals open at ~, not $GITHUB_WORKSPACE.
-          cd /root || cd ~
-          export HOME=/root
+          # Run setup as $RUNNER (HOME=/home/runner). Only the upterm daemon
+          # itself runs via sudo with HOME=/root so terminals land in a root
+          # shell. Touching /root as runner fails (700 root:root) - that was
+          # killing the job at mkdir -p ~/.ssh with exit 1 under bash -e.
+          cd ~ || true
 
           clean_ansi() {
             printf '%s' "$1" | sed -r -e 's/\x1b\][^\x07]*(\x07|\x1b\\)//g' -e 's/\x1b\[[0-9;?]*[ -\/]*[@-~]//g' | tr -d '\r'
@@ -89,9 +91,9 @@ jobs:
           printf '# upterm tmux conf\nset-environment -g XDG_RUNTIME_DIR "%s"\nset-environment -g XDG_STATE_HOME "%s"\nset-environment -g XDG_CONFIG_HOME "%s"\nset-option -ga update-environment " UPTERM_ADMIN_SOCKET"\nsetw -g aggressive-resize on\n' \
             "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" > /tmp/upterm-data/tmux.conf
 
-          # --- start session detached; ALL output goes to file, never to logs ---
-          tmux -f /tmp/upterm-data/tmux.conf new -d -s upterm-wrapper -x 132 -y 43 \
-            "$UPTERM host --skip-host-key-check --accept --server 'ssh://uptermd.upterm.dev:22' --github-user '$UPTERM_ACTOR' --force-command 'tmux attach -t upterm' -- tmux -f /tmp/upterm-data/tmux.conf new -s upterm -x 132 -y 43 2>&1 | tee $CMDLOG"
+          # --- start session detached as root; ALL output goes to file, never to logs ---
+          sudo -E HOME=/root tmux -f /tmp/upterm-data/tmux.conf new -d -s upterm-wrapper -x 132 -y 43 \
+            "$UPTERM host --skip-host-key-check --accept --server 'ssh://uptermd.upterm.dev:22' --github-user \"$UPTERM_ACTOR\" --force-command 'tmux attach -t upterm' -- tmux -f /tmp/upterm-data/tmux.conf new -s upterm -x 132 -y 43 2>&1 | tee $CMDLOG"
 
           # --- wait for admin socket ---
           SOCK=""
@@ -103,7 +105,7 @@ jobs:
           if [ -z "$SOCK" ]; then echo "upterm failed to start (no admin socket)"; tail -n 50 "$CMDLOG" 2>/dev/null | sed 's/ssh [^ ]*@[^ ]*/ssh [REDACTED]/g'; exit 1; fi
 
           # --- extract ssh command from socket (never printed) ---
-          INFO="$("$UPTERM" session current --admin-socket "$SOCK" 2>/dev/null)"
+          INFO="$(sudo -E HOME=/root "$UPTERM" session current --admin-socket "$SOCK" 2>/dev/null)"
           SSH_CMD="$(printf '%s' "$INFO" | grep -oE 'ssh [^[:space:]]+@[^[:space:]]+' | head -n1)"
           SSH_CMD="$(clean_ansi "$SSH_CMD" | awk '{print $1, $2}')"
           if [ -z "$SSH_CMD" ]; then echo "could not parse ssh command"; exit 1; fi
@@ -121,5 +123,5 @@ jobs:
             sleep 15
             [ -f /continue ] || [ -f "$GITHUB_WORKSPACE/continue" ] && { echo "continue file found, exiting"; break; }
             ls "$SOCKDIR"/*.sock >/dev/null 2>&1 || { echo "session ended"; break; }
-            tmux has-session -t upterm-wrapper 2>/dev/null || { echo "session ended"; break; }
+            sudo tmux -f /tmp/upterm-data/tmux.conf has-session -t upterm-wrapper 2>/dev/null || { echo "session ended"; break; }
           done
