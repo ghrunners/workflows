@@ -92,7 +92,9 @@ jobs:
             "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" > /tmp/upterm-data/tmux.conf
 
           # --- start session detached as root; ALL output goes to file, never to logs ---
-          sudo -E HOME=/root tmux -f /tmp/upterm-data/tmux.conf new -d -s upterm-wrapper -x 132 -y 43 \
+          # NOTE: sudo strips XDG_* unless passed explicitly, so pass them through.
+          sudo XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" HOME=/root \
+            tmux -f /tmp/upterm-data/tmux.conf new -d -s upterm-wrapper -x 132 -y 43 \
             "$UPTERM host --skip-host-key-check --accept --server 'ssh://uptermd.upterm.dev:22' --github-user \"$UPTERM_ACTOR\" --force-command 'tmux attach -t upterm' -- tmux -f /tmp/upterm-data/tmux.conf new -s upterm -x 132 -y 43 2>&1 | tee $CMDLOG"
 
           # --- wait for admin socket ---
@@ -102,10 +104,18 @@ jobs:
             [ -n "$SOCK" ] && break
             sleep 2
           done
-          if [ -z "$SOCK" ]; then echo "upterm failed to start (no admin socket)"; tail -n 50 "$CMDLOG" 2>/dev/null | sed 's/ssh [^ ]*@[^ ]*/ssh [REDACTED]/g'; exit 1; fi
+          if [ -z "$SOCK" ]; then
+            echo "upterm failed to start (no admin socket in $SOCKDIR)"
+            echo "--- ls /tmp/upterm-data ---"; ls -R /tmp/upterm-data 2>/dev/null | head -n 30
+            echo "--- sudo ls /tmp/upterm-data ---"; sudo ls -R /tmp/upterm-data 2>/dev/null | head -n 30
+            echo "--- find sockets ---"; sudo find /tmp /root -name "*.sock" 2>/dev/null | head -n 20
+            echo "--- tmux pane ---"; sudo tmux -f /tmp/upterm-data/tmux.conf capture-pane -t upterm-wrapper -p 2>/dev/null | tail -n 30 | sed 's/ssh [^ ]*@[^ ]*/ssh [REDACTED]/g'
+            echo "--- cmdlog ---"; tail -n 50 "$CMDLOG" 2>/dev/null | sed 's/ssh [^ ]*@[^ ]*/ssh [REDACTED]/g'
+            exit 1
+          fi
 
           # --- extract ssh command from socket (never printed) ---
-          INFO="$(sudo -E HOME=/root "$UPTERM" session current --admin-socket "$SOCK" 2>/dev/null)"
+          INFO="$(sudo XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" HOME=/root "$UPTERM" session current --admin-socket "$SOCK" 2>/dev/null)"
           SSH_CMD="$(printf '%s' "$INFO" | grep -oE 'ssh [^[:space:]]+@[^[:space:]]+' | head -n1)"
           SSH_CMD="$(clean_ansi "$SSH_CMD" | awk '{print $1, $2}')"
           if [ -z "$SSH_CMD" ]; then echo "could not parse ssh command"; exit 1; fi
